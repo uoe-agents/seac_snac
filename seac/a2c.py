@@ -36,6 +36,8 @@ def config():
     num_processes = 4
     num_steps = 5
 
+    parameter_sharing = False
+
     device = "cpu"
 
 
