@@ -59,6 +59,8 @@ def config():
     eval_interval = int(1e6)
     episodes_per_eval = 8
 
+    episodes_per_log = 10
+
 
 for conf in glob.glob("configs/*.yaml"):
     name = f"{Path(conf).stem}"
@@ -181,6 +183,7 @@ def main(
     log_interval,
     save_interval,
     eval_interval,
+    episodes_per_log,
 ):
 
     if loss_dir:
@@ -235,7 +238,7 @@ def main(
         int(num_env_steps) // algorithm["num_steps"] // algorithm["num_processes"]
     )
 
-    all_infos = deque(maxlen=10)
+    all_infos = deque(maxlen=episodes_per_log)
 
     for j in range(1, num_updates + 1):
 
