@@ -24,7 +24,7 @@ from envs import make_vec_envs
 from wrappers import RecordEpisodeStatistics, SquashDones
 from model import Policy
 
-import robotic_warehouse # noqa
+# import robotic_warehouse # noqa
 import lbforaging # noqa
 
 ex = Experiment(ingredients=[algorithm])
@@ -102,28 +102,50 @@ def evaluate(
     )
 
     n_obs = eval_envs.reset()
-    n_recurrent_hidden_states = [
-        torch.zeros(
-            episodes_per_eval, agent.model.recurrent_hidden_state_size, device=device
-        )
-        for agent in agents
-    ]
+
+    if algorithm["parameter_sharing"]:
+        n_recurrent_hidden_states = [
+            torch.zeros(
+                episodes_per_eval, agents[0].model.recurrent_hidden_state_size, device=device
+            )
+            for _ in range(len(agents[0].storage))
+        ]
+    else:
+        n_recurrent_hidden_states = [
+            torch.zeros(
+                episodes_per_eval, agent.model.recurrent_hidden_state_size, device=device
+            )
+            for agent in agents
+        ]
     masks = torch.zeros(episodes_per_eval, 1, device=device)
 
     all_infos = []
 
     while len(all_infos) < episodes_per_eval:
         with torch.no_grad():
-            _, n_action, _, n_recurrent_hidden_states = zip(
-                *[
-                    agent.model.act(
-                        n_obs[agent.agent_id], recurrent_hidden_states, masks
-                    )
-                    for agent, recurrent_hidden_states in zip(
-                        agents, n_recurrent_hidden_states
-                    )
-                ]
-            )
+
+            if algorithm["parameter_sharing"]:
+                _, n_action, _, n_recurrent_hidden_states = zip(
+                    *[
+                        agents[0].model.act(
+                            agents[0].storage[i].obs[0],
+                            n_recurrent_hidden_states[i],
+                            masks,
+                        )
+                        for i in range(len(agents[0].storage))
+                    ]
+                )
+            else:
+                _, n_action, _, n_recurrent_hidden_states = zip(
+                    *[
+                        agent.model.act(
+                            n_obs[agent.agent_id], recurrent_hidden_states, masks
+                        )
+                        for agent, recurrent_hidden_states in zip(
+                            agents, n_recurrent_hidden_states
+                        )
+                    ]
+                )
 
         # Obser reward and next obs
         n_obs, _, done, infos = eval_envs.step(n_action)
@@ -189,11 +211,24 @@ def main(
         A2C(i, osp, asp)
         for i, (osp, asp) in enumerate(zip(envs.observation_space, envs.action_space))
     ]
+    
+    # setup rollout storage
+    n_agents = len(agents)
+    for agent in agents:
+        agent.setup_rollout_storage(n_agents)
+
+    if algorithm["parameter_sharing"]:
+        agents = [agents[0]]
+
     obs = envs.reset()
 
     for i in range(len(obs)):
-        agents[i].storage.obs[0].copy_(obs[i])
-        agents[i].storage.to(algorithm["device"])
+        if algorithm["parameter_sharing"]:
+            agents[0].storage[i].obs[0].copy_(obs[i])
+            agents[0].storage[i].to(algorithm["device"])
+        else:
+            agents[i].storage.obs[0].copy_(obs[i])
+            agents[i].storage.to(algorithm["device"])
 
     start = time.time()
     num_updates = (
@@ -207,16 +242,28 @@ def main(
         for step in range(algorithm["num_steps"]):
             # Sample actions
             with torch.no_grad():
-                n_value, n_action, n_action_log_prob, n_recurrent_hidden_states = zip(
-                    *[
-                        agent.model.act(
-                            agent.storage.obs[step],
-                            agent.storage.recurrent_hidden_states[step],
-                            agent.storage.masks[step],
-                        )
-                        for agent in agents
-                    ]
-                )
+                if algorithm["parameter_sharing"]:
+                    n_value, n_action, n_action_log_prob, n_recurrent_hidden_states = zip(
+                        *[
+                            agents[0].model.act(
+                                agents[0].storage[i].obs[step],
+                                agents[0].storage[i].recurrent_hidden_states[step],
+                                agents[0].storage[i].masks[step],
+                            )
+                            for i in range(len(agents[0].storage))
+                        ]
+                    )
+                else:
+                    n_value, n_action, n_action_log_prob, n_recurrent_hidden_states = zip(
+                        *[
+                            agent.model.act(
+                                agent.storage.obs[step],
+                                agent.storage.recurrent_hidden_states[step],
+                                agent.storage.masks[step],
+                            )
+                            for agent in agents
+                        ]
+                    )
             # Obser reward and next obs
             obs, reward, done, infos = envs.step(n_action)
             # envs.envs[0].render()
@@ -230,17 +277,31 @@ def main(
                     for info in infos
                 ]
             )
-            for i in range(len(agents)):
-                agents[i].storage.insert(
-                    obs[i],
-                    n_recurrent_hidden_states[i],
-                    n_action[i],
-                    n_action_log_prob[i],
-                    n_value[i],
-                    reward[:, i].unsqueeze(1),
-                    masks,
-                    bad_masks,
-                )
+
+            if algorithm["parameter_sharing"]:
+                for i in range(len(agents[0].storage)):
+                    agents[0].storage[i].insert(
+                        obs[i],
+                        n_recurrent_hidden_states[i],
+                        n_action[i],
+                        n_action_log_prob[i],
+                        n_value[i],
+                        reward[:, i].unsqueeze(1),
+                        masks,
+                        bad_masks,
+                    )
+            else:
+                for i in range(len(agents)):
+                    agents[i].storage.insert(
+                        obs[i],
+                        n_recurrent_hidden_states[i],
+                        n_action[i],
+                        n_action_log_prob[i],
+                        n_value[i],
+                        reward[:, i].unsqueeze(1),
+                        masks,
+                        bad_masks,
+                    )
 
             for info in infos:
                 if info:
@@ -251,13 +312,20 @@ def main(
             agent.compute_returns()
 
         for agent in agents:
-            loss = agent.update([a.storage for a in agents])
+            if algorithm["parameter_sharing"]:
+                loss = agent.update(agents[0].storage)
+            else:
+                loss = agent.update([a.storage for a in agents])
             for k, v in loss.items():
                 if writer:
                     writer.add_scalar(f"agent{agent.agent_id}/{k}", v, j)
 
         for agent in agents:
-            agent.storage.after_update()
+            if algorithm["parameter_sharing"]:
+                for i in range(len(agent.storage)):
+                    agent.storage[i].after_update()
+            else:
+                agent.storage.after_update()
 
         if j % log_interval == 0 and len(all_infos) > 1:
             squashed = _squash_info(all_infos)

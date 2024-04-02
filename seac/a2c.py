@@ -36,9 +36,9 @@ def config():
     num_processes = 4
     num_steps = 5
 
-    parameter_sharing = False
-
     device = "cpu"
+
+    parameter_sharing = False
 
 
 class A2C:
@@ -54,6 +54,7 @@ class A2C:
         num_steps,
         num_processes,
         device,
+        parameter_sharing,
     ):
         self.agent_id = agent_id
         self.obs_size = flatdim(obs_space)
@@ -61,16 +62,12 @@ class A2C:
         self.obs_space = obs_space
         self.action_space = action_space
 
+        self.num_steps = num_steps
+        self.num_processes = num_processes
+        self.parameter_sharing = parameter_sharing
+
         self.model = Policy(
             obs_space, action_space, base_kwargs={"recurrent": recurrent_policy},
-        )
-
-        self.storage = RolloutStorage(
-            obs_space,
-            action_space,
-            self.model.recurrent_hidden_state_size,
-            num_steps,
-            num_processes,
         )
 
         self.model.to(device)
@@ -81,6 +78,30 @@ class A2C:
             "model": self.model,
             "optimizer": self.optimizer,
         }
+
+    def setup_rollout_storage(self, n_agents):
+        # add list of storages if parameter sharing
+        if self.parameter_sharing:
+            self.storage = [
+                RolloutStorage(
+                    self.obs_space,
+                    self.action_space,
+                    self.model.recurrent_hidden_state_size,
+                    self.num_steps,
+                    self.num_processes,
+                )
+                for _ in range(n_agents)
+            ]
+        else:
+            self.storage = RolloutStorage(
+                self.obs_space,
+                self.action_space,
+                self.model.recurrent_hidden_state_size,
+                self.num_steps,
+                self.num_processes,
+            )
+
+
 
     def save(self, path):
         torch.save(self.saveables, os.path.join(path, "models.pt"))
@@ -93,15 +114,31 @@ class A2C:
     @algorithm.capture
     def compute_returns(self, use_gae, gamma, gae_lambda, use_proper_time_limits):
         with torch.no_grad():
-            next_value = self.model.get_value(
-                self.storage.obs[-1],
-                self.storage.recurrent_hidden_states[-1],
-                self.storage.masks[-1],
-            ).detach()
+            if self.parameter_sharing:
+                next_values = []
+                for i in range(len(self.storage)):
+                    next_value = self.model.get_value(
+                        self.storage[i].obs[-1],
+                        self.storage[i].recurrent_hidden_states[-1],
+                        self.storage[i].masks[-1],
+                    ).detach()
+                    next_values.append(next_value)
+            else:
+                next_value = self.model.get_value(
+                    self.storage.obs[-1],
+                    self.storage.recurrent_hidden_states[-1],
+                    self.storage.masks[-1],
+                ).detach()
 
-        self.storage.compute_returns(
-            next_value, use_gae, gamma, gae_lambda, use_proper_time_limits,
-        )
+        if self.parameter_sharing:
+            for i, next_value in enumerate(next_values):
+                self.storage[i].compute_returns(
+                    next_value, use_gae, gamma, gae_lambda, use_proper_time_limits,
+                )
+        else:
+            self.storage.compute_returns(
+                next_value, use_gae, gamma, gae_lambda, use_proper_time_limits,
+            )
 
     @algorithm.capture
     def update(
@@ -114,79 +151,126 @@ class A2C:
         device,
     ):
 
-        obs_shape = self.storage.obs.size()[2:]
-        action_shape = self.storage.actions.size()[-1]
-        num_steps, num_processes, _ = self.storage.rewards.size()
+        if self.parameter_sharing:
 
-        values, action_log_probs, dist_entropy, _ = self.model.evaluate_actions(
-            self.storage.obs[:-1].view(-1, *obs_shape),
-            self.storage.recurrent_hidden_states[0].view(
-                -1, self.model.recurrent_hidden_state_size
-            ),
-            self.storage.masks[:-1].view(-1, 1),
-            self.storage.actions.view(-1, action_shape),
-        )
-
-        values = values.view(num_steps, num_processes, 1)
-        action_log_probs = action_log_probs.view(num_steps, num_processes, 1)
-
-        advantages = self.storage.returns[:-1] - values
-
-        policy_loss = -(advantages.detach() * action_log_probs).mean()
-        value_loss = advantages.pow(2).mean()
+            obs_shape = self.storage[0].obs.size()[2:]
+            action_shape = self.storage[0].actions.size()[-1]
+            num_steps, num_processes, _ = self.storage[0].rewards.size()
 
 
-        # calculate prediction loss for the OTHER actor
-        other_agent_ids = [x for x in range(len(storages)) if x != self.agent_id]
-        seac_policy_loss = 0
-        seac_value_loss = 0
-        for oid in other_agent_ids:
+            policy_loss = 0
+            value_loss = 0
+            for i in range(len(self.storage)):
+                values, action_log_probs, dist_entropy, _ = self.model.evaluate_actions(
+                    self.storage[i].obs[:-1].view(-1, *obs_shape),
+                    self.storage[i]
+                    .recurrent_hidden_states[0]
+                    .view(-1, self.model.recurrent_hidden_state_size),
+                    self.storage[i].masks[:-1].view(-1, 1),
+                    self.storage[i].actions.view(-1, action_shape),
+                )
 
-            other_values, logp, _, _ = self.model.evaluate_actions(
-                storages[oid].obs[:-1].view(-1, *obs_shape),
-                storages[oid]
-                .recurrent_hidden_states[0]
-                .view(-1, self.model.recurrent_hidden_state_size),
-                storages[oid].masks[:-1].view(-1, 1),
-                storages[oid].actions.view(-1, action_shape),
+                values = values.view(num_steps, num_processes, 1)
+                action_log_probs = action_log_probs.view(num_steps, num_processes, 1)
+
+                advantages = self.storage[i].returns[:-1] - values
+
+                policy_loss += -(advantages.detach() * action_log_probs).mean()
+                value_loss += advantages.pow(2).mean()
+
+            self.optimizer.zero_grad()
+            (
+                policy_loss
+                + value_loss_coef * value_loss
+                - entropy_coef * dist_entropy
+            ).backward()
+
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+
+            self.optimizer.step()
+
+            return {
+                "policy_loss": policy_loss.item(),
+                "value_loss": value_loss_coef * value_loss.item(),
+                "dist_entropy": entropy_coef * dist_entropy.item(),
+            }
+
+
+        else:
+
+            obs_shape = self.storage.obs.size()[2:]
+            action_shape = self.storage.actions.size()[-1]
+            num_steps, num_processes, _ = self.storage.rewards.size()
+
+            values, action_log_probs, dist_entropy, _ = self.model.evaluate_actions(
+                self.storage.obs[:-1].view(-1, *obs_shape),
+                self.storage.recurrent_hidden_states[0].view(
+                    -1, self.model.recurrent_hidden_state_size
+                ),
+                self.storage.masks[:-1].view(-1, 1),
+                self.storage.actions.view(-1, action_shape),
             )
-            other_values = other_values.view(num_steps, num_processes, 1)
-            logp = logp.view(num_steps, num_processes, 1)
-            other_advantage = (
-                storages[oid].returns[:-1] - other_values
-            )  # or storages[oid].rewards
 
-            importance_sampling = (
-                logp.exp() / (storages[oid].action_log_probs.exp() + 1e-7)
-            ).detach()
-            # importance_sampling = 1.0
-            seac_value_loss += (
-                importance_sampling * other_advantage.pow(2)
-            ).mean()
-            seac_policy_loss += (
-                -importance_sampling * logp * other_advantage.detach()
-            ).mean()
+            values = values.view(num_steps, num_processes, 1)
+            action_log_probs = action_log_probs.view(num_steps, num_processes, 1)
 
-        self.optimizer.zero_grad()
-        (
-            policy_loss
-            + value_loss_coef * value_loss
-            - entropy_coef * dist_entropy
-            + seac_coef * seac_policy_loss
-            + seac_coef * value_loss_coef * seac_value_loss
-        ).backward()
+            advantages = self.storage.returns[:-1] - values
 
-        nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+            policy_loss = -(advantages.detach() * action_log_probs).mean()
+            value_loss = advantages.pow(2).mean()
 
-        self.optimizer.step()
 
-        return {
-            "policy_loss": policy_loss.item(),
-            "value_loss": value_loss_coef * value_loss.item(),
-            "dist_entropy": entropy_coef * dist_entropy.item(),
-            "importance_sampling": importance_sampling.mean().item(),
-            "seac_policy_loss": seac_coef * seac_policy_loss.item(),
-            "seac_value_loss": seac_coef
-            * value_loss_coef
-            * seac_value_loss.item(),
-        }
+            # calculate prediction loss for the OTHER actor
+            other_agent_ids = [x for x in range(len(storages)) if x != self.agent_id]
+            seac_policy_loss = 0
+            seac_value_loss = 0
+            for oid in other_agent_ids:
+
+                other_values, logp, _, _ = self.model.evaluate_actions(
+                    storages[oid].obs[:-1].view(-1, *obs_shape),
+                    storages[oid]
+                    .recurrent_hidden_states[0]
+                    .view(-1, self.model.recurrent_hidden_state_size),
+                    storages[oid].masks[:-1].view(-1, 1),
+                    storages[oid].actions.view(-1, action_shape),
+                )
+                other_values = other_values.view(num_steps, num_processes, 1)
+                logp = logp.view(num_steps, num_processes, 1)
+                other_advantage = (
+                    storages[oid].returns[:-1] - other_values
+                )  # or storages[oid].rewards
+
+                importance_sampling = (
+                    logp.exp() / (storages[oid].action_log_probs.exp() + 1e-7)
+                ).detach()
+                # importance_sampling = 1.0
+                seac_value_loss += (
+                    importance_sampling * other_advantage.pow(2)
+                ).mean()
+                seac_policy_loss += (
+                    -importance_sampling * logp * other_advantage.detach()
+                ).mean()
+
+            self.optimizer.zero_grad()
+            (
+                policy_loss
+                + value_loss_coef * value_loss
+                - entropy_coef * dist_entropy
+                + seac_coef * seac_policy_loss
+                + seac_coef * value_loss_coef * seac_value_loss
+            ).backward()
+
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+
+            self.optimizer.step()
+
+            return {
+                "policy_loss": policy_loss.item(),
+                "value_loss": value_loss_coef * value_loss.item(),
+                "dist_entropy": entropy_coef * dist_entropy.item(),
+                "importance_sampling": importance_sampling.mean().item(),
+                "seac_policy_loss": seac_coef * seac_policy_loss.item(),
+                "seac_value_loss": seac_coef
+                * value_loss_coef
+                * seac_value_loss.item(),
+            }
