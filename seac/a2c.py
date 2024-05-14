@@ -40,6 +40,8 @@ def config():
 
     parameter_sharing = False
 
+    selective_lambda = torch.tensor([[1,0,1,0,1], [0,1,0,1,0],[1,0,1,0,1], [0,1,0,1,0],[1,0,1,0,1]])
+
 
 class A2C:
     @algorithm.capture()
@@ -55,6 +57,7 @@ class A2C:
         num_processes,
         device,
         parameter_sharing,
+        selective_lambda,
     ):
         self.agent_id = agent_id
         self.obs_size = flatdim(obs_space)
@@ -65,6 +68,7 @@ class A2C:
         self.num_steps = num_steps
         self.num_processes = num_processes
         self.parameter_sharing = parameter_sharing
+        self.selective_lambda = selective_lambda
 
         self.model = Policy(
             obs_space, action_space, base_kwargs={"recurrent": recurrent_policy},
@@ -100,9 +104,7 @@ class A2C:
                 self.num_steps,
                 self.num_processes,
             )
-
-
-
+        
     def save(self, path):
         torch.save(self.saveables, os.path.join(path, "models.pt"))
 
@@ -224,6 +226,15 @@ class A2C:
             other_agent_ids = [x for x in range(len(storages)) if x != self.agent_id]
             seac_policy_loss = 0
             seac_value_loss = 0
+
+
+            # if selective lambda is None, set it to a 2d list of ones with size (n_agents, n_agents)
+            if self.selective_lambda is None:
+                self.selective_lambda = torch.ones(len(storages), len(storages))
+            else: # assert that the selective lambda matrix is the correct size
+                assert len(self.selective_lambda) == len(storages) , "selective lambda must be a square matrix of size n_agents"
+                assert len(self.selective_lambda[0]) == len(storages), "selective lambda must be a square matrix of size n_agents"
+
             for oid in other_agent_ids:
 
                 other_values, logp, _, _ = self.model.evaluate_actions(
@@ -244,10 +255,10 @@ class A2C:
                     logp.exp() / (storages[oid].action_log_probs.exp() + 1e-7)
                 ).detach()
                 # importance_sampling = 1.0
-                seac_value_loss += (
+                seac_value_loss += self.selective_lambda[self.agent_id, oid] * (
                     importance_sampling * other_advantage.pow(2)
                 ).mean()
-                seac_policy_loss += (
+                seac_policy_loss += self.selective_lambda[self.agent_id, oid ] * (
                     -importance_sampling * logp * other_advantage.detach()
                 ).mean()
 
